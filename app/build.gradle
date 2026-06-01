@@ -1,0 +1,107 @@
+plugins {
+    id 'com.android.application'
+}
+
+android {
+    // 【请将这里替换为你实际创建项目时的包名】
+    namespace 'com.goda.mypic'
+    compileSdk 34 // 兼容最新 Android 14 API
+
+    // 添加这一行，强制使用老版本 NDK 编译 C++ 代码
+    ndkVersion "21.4.7075529"
+    // 🚨 【核心修复】：强制指定与 Paddle 和 OpenCV 完美兼容的经典 NDK 版本
+    // (Gradle 同步时会自动下载此版本，绝不使用系统默认的新版 NDK)
+//    ndkVersion "20.1.5948944"
+
+    defaultConfig {
+        applicationId "com.goda.mypic" // 同上
+        minSdk 24    // Android 7.0 足够兼容 HarmonyOS 3.0，也是 PaddleLite 的最低要求
+        targetSdk 34
+        versionCode 1
+        versionName "1.0"
+
+        // NDK 配置：指定只编译/打包 64 位架构，完美契合麒麟 820，同时大幅减小 APK 体积
+        ndk {
+            abiFilters 'arm64-v8a'
+        }
+
+        // CMake 编译参数，Paddle Lite 官方推荐配置
+        externalNativeBuild {
+            cmake {
+//                cppFlags "-std=c++11 -frtti -fexceptions -Wno-format"
+//                arguments '-DANDROID_STL=c++_shared'
+                cppFlags "-std=c++11"
+                // 🚨 【核心修复 2】：让指定的 NDK 自动打包正确版本的 C++ 标准库
+                arguments "-DANDROID_STL=c++_shared"
+            }
+        }
+    }
+
+    // 绑定 CMakeLists.txt 路径
+    externalNativeBuild {
+        cmake {
+            // 请确保你已经把 PaddleOCR demo 里的 CMakeLists.txt 放到了这个路径
+            path "src/main/cpp/CMakeLists.txt"
+            version "3.22.1"
+        }
+    }
+
+    // 告诉 Gradle 预编译好的 .so 库放在哪里
+    sourceSets {
+        main {
+            jniLibs.srcDirs = ['src/main/jniLibs']
+        }
+    }
+
+    // 🚨 【核心修复】：告诉系统优先使用我们自己放的库，且绝对不要剥离符号！
+    packagingOptions {
+        pickFirst 'lib/arm64-v8a/libc++_shared.so'
+        pickFirst 'lib/arm64-v8a/libopencv_java4.so'
+        pickFirst 'lib/arm64-v8a/libpaddle_light_api_shared.so'
+        doNotStrip "**/*.so"
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+        }
+    }
+
+    // AGP 8+ 要求使用 Java 17
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    // 🚨 【终极修复 3】：禁止 Android 压缩 .nb 模型文件，保持原汁原味！
+    aaptOptions {
+        noCompress "nb"
+    }
+}
+
+dependencies {
+
+    // 引入 PhotoView 库，实现双指无极缩放，完美兼容 ViewPager2 滑动
+    implementation 'com.github.chrisbanes:PhotoView:2.3.0'
+
+    implementation 'androidx.documentfile:documentfile:1.0.1'
+    // 基础 Android UI 组件库
+    implementation 'androidx.appcompat:appcompat:1.6.1'
+    implementation 'com.google.android.material:material:1.11.0'
+    implementation 'androidx.constraintlayout:constraintlayout:2.1.4'
+
+    // ================== 核心业务组件库 ==================
+
+    // 1. Glide图片加载库 (处理上万张图片网格展示防卡顿)
+    implementation 'com.github.bumptech.glide:glide:4.16.0'
+    annotationProcessor 'com.github.bumptech.glide:compiler:4.16.0'
+
+    // 2. Room 数据库 (用于保存图片路径、OCR文字、Hash值进行极速搜索)
+    def room_version = "2.6.1"
+    implementation "androidx.room:room-runtime:$room_version"
+    annotationProcessor "androidx.room:room-compiler:$room_version"
+
+    // 3. WorkManager (用于在后台静默跑 OCR 和生成指纹，避免主线程卡死)
+    implementation "androidx.work:work-runtime:2.9.0"
+}

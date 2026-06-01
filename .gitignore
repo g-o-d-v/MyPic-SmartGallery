@@ -1,0 +1,38 @@
+*.iml
+.gradle
+/local.properties
+/.idea/caches
+/.idea/libraries
+/.idea/modules.xml
+/.idea/workspace.xml
+/.idea/navEditor.xml
+/.idea/assetWizardSettings.xml
+.DS_Store
+/build
+/captures
+.externalNativeBuild
+.cxx
+local.properties
+
+# =========================
+# 🚨 MyPic 专属隐私与产物拦截规则
+# =========================
+
+# 1. 绝对禁止上传签名文件！
+*.jks
+*.keystore
+*.key
+
+# 2. 禁止上传任何打包生成的 APK 和输出清单
+/app/release/
+/app/debug/
+*.apk
+output-metadata.json
+
+# 3. 禁止上传本地测试用的数据库备份
+/app/backup/
+/backup/
+mypic_ocr_database*
+
+# 4. 忽略 AS 的本地配置文件 (如果有的话)
+local.properties

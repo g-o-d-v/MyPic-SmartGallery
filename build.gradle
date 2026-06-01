@@ -1,0 +1,12 @@
+// Top-level build file where you can add configuration options common to all sub-projects/modules.
+plugins {
+    // Android 应用构建插件
+    id 'com.android.application' version '8.2.2' apply false
+    // 即使主要写 Java，现代 Android 开发也依赖 Kotlin 插件的底层支持
+    id 'org.jetbrains.kotlin.android' version '1.9.22' apply false
+}
+
+// 清理任务
+tasks.register('clean', Delete) {
+    delete rootProject.buildDir
+}

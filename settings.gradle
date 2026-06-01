@@ -1,0 +1,32 @@
+pluginManagement {
+    repositories {
+        // 优先使用阿里云镜像下载 Gradle 插件
+        maven { url 'https://maven.aliyun.com/repository/gradle-plugin' }
+        maven { url 'https://maven.aliyun.com/repository/google' }
+        maven { url 'https://maven.aliyun.com/repository/public' }
+
+        // 官方备用源
+        google()
+        mavenCentral()
+        gradlePluginPortal()
+    }
+}
+
+dependencyResolutionManagement {
+    // 强制所有模块使用这里的仓库配置
+    repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+    repositories {
+        // 优先使用阿里云镜像下载第三方代码库依赖
+        maven { url 'https://maven.aliyun.com/repository/google' }
+        maven { url 'https://maven.aliyun.com/repository/public' }
+
+        // 官方备用源
+        google()
+        mavenCentral()
+        maven { url 'https://jitpack.io' } // 很多开源库需要的 JitPack 仓库
+    }
+}
+
+// 替换为你的项目名称
+rootProject.name = "MyPic"
+include ':app'
