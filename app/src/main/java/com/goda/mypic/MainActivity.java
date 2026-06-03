@@ -125,6 +125,9 @@ public class MainActivity extends AppCompatActivity {
     // 🚨 新增：用于判断是否为刚刚打开 App
     private boolean isFirstLaunch = true;
 
+    // 🚨 新增：全局操作冷却锁，防止 MediaStore 幽灵数据复活
+    public static long lastLocalActionTime = 0;
+
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -999,6 +1002,12 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void removePendingItemsFromUI() {
+
+        // =========================================================
+        // 🚨 核心添加：只要执行了界面移除，说明刚刚发生了真实删除/移动，立刻重置冷却时间！
+        MainActivity.lastLocalActionTime = System.currentTimeMillis();
+        // =========================================================
+
         allMediaList.removeAll(pendingRemoveItems);
         cameraList.removeAll(pendingRemoveItems);
         screenshotList.removeAll(pendingRemoveItems);
@@ -1168,16 +1177,16 @@ public class MainActivity extends AppCompatActivity {
         }
     }
 
-    // ================= 🚨 新增：切回 App 时自动静默刷新 =================
+    // ================= 🚨 修复版：带冷却防抖的静默刷新 =================
     @Override
     protected void onResume() {
         super.onResume();
-        // 如果 isFirstLaunch 已经是 false，说明这不是第一次冷启动
-        // 而是用户从别的 App（比如去微信存了张图，或者去相机拍了张照）切回来的
         if (!isFirstLaunch) {
-            // 重新走一遍扫描流。因为 isFirstLaunch 已经是 false 了，
-            // 这一次底层的 startBackgroundOcrIndexing 会完全静默执行，不会打扰用户
-            checkPermissionsAndScan();
+            // 核心修复：如果距离上一次 App 内的删除等操作不到 2 秒，直接跳过本次系统刷新！
+            // 给安卓底层的 MediaStore 留出同步删除记录的时间，彻底掐死幽灵数据
+            if (System.currentTimeMillis() - lastLocalActionTime > 2000) {
+                checkPermissionsAndScan();
+            }
         }
     }
 
