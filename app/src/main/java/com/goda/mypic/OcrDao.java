@@ -16,6 +16,10 @@ public interface OcrDao {
     @Query("SELECT dateModified FROM image_ocr_table WHERE imageUri = :uri LIMIT 1")
     Long getModifiedDate(String uri);
 
+    // 读取单张图片已经缓存的 OCR 文本，供查看页“一键复制文字”直接复用。
+    @Query("SELECT extractedText FROM image_ocr_table WHERE imageUri = :uri LIMIT 1")
+    String getExtractedText(String uri);
+
     // 3. 🚨 极速秒搜：用 SQL 模糊匹配关键字
     @Query("SELECT imageUri FROM image_ocr_table WHERE extractedText LIKE '%' || :keyword || '%'")
     List<String> searchImagesByKeyword(String keyword);
@@ -27,6 +31,21 @@ public interface OcrDao {
     // 5. 精准捞出真正有文字的图片 URI (排除空字符串和 NULL)
     @Query("SELECT imageUri FROM image_ocr_table WHERE length(extractedText) > 0")
     List<String> getUrisWithText();
+
+    // ================= 相似图片指纹缓存 =================
+
+    @Query("SELECT * FROM similarity_fingerprint_table")
+    List<SimilarityFingerprintData> getAllSimilarityFingerprints();
+
+    // 分页读取大图库指纹，避免 32x32 BLOB 累计超过 Android CursorWindow（常见约 2 MB）。
+    @Query("SELECT * FROM similarity_fingerprint_table ORDER BY imageUri LIMIT :limit OFFSET :offset")
+    List<SimilarityFingerprintData> getSimilarityFingerprintPage(int limit, int offset);
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    void insertSimilarityFingerprints(List<SimilarityFingerprintData> data);
+
+    @Query("DELETE FROM similarity_fingerprint_table WHERE imageUri = :uri")
+    void deleteSimilarityFingerprintByUri(String uri);
 
     // ================= 以下为新增的高速检索接口 =================
 

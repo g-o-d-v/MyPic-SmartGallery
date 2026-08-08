@@ -4,6 +4,8 @@ import android.Manifest;
 import android.app.Activity;
 import android.app.AlertDialog;
 import android.app.DatePickerDialog;
+import android.content.ClipData;
+import android.content.ClipboardManager;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
@@ -57,8 +59,11 @@ import java.util.LinkedList;
 import java.util.List;
 import java.util.Locale;
 import java.util.Queue;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 
 public class MainActivity extends AppCompatActivity {
 
@@ -128,6 +133,22 @@ public class MainActivity extends AppCompatActivity {
     // 🚨 新增：全局操作冷却锁，防止 MediaStore 幽灵数据复活
     public static long lastLocalActionTime = 0;
 
+    // 删除确认页会触发 Activity 的 pause/resume。用稳定快照 + 扫描代次彻底隔离旧扫描结果。
+    private final List<MediaItem> pendingSystemDeleteItems = new ArrayList<>();
+    private final AtomicInteger mediaScanGeneration = new AtomicInteger(0);
+    private final ConcurrentHashMap<String, Long> recentlyRemovedUris = new ConcurrentHashMap<>();
+    private static final long MEDIASTORE_DELETE_GRACE_MS = 12_000L;
+
+    // 防止 onResume/手动刷新反复启动多条 7000 张规模的 OCR 全量索引任务。
+    private final AtomicBoolean ocrIndexingRunning = new AtomicBoolean(false);
+    private volatile boolean userOcrInProgress = false;
+    private volatile boolean galleryScrollBusy = false;
+
+    // 外部文件管理器 ACTION_VIEW 打开的单张图片使用独立列表，避免被后台相册扫描覆盖。
+    private final List<MediaItem> externalViewerList = new ArrayList<>();
+    private boolean isViewingExternalImage = false;
+    private boolean openedFromExternalIntent = false;
+
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -148,7 +169,15 @@ public class MainActivity extends AppCompatActivity {
         });
 
         initViews(); initRecyclerViews(); initListeners();
-        checkPermissionsAndScan();
+
+        // 从系统文件管理器/第三方应用“用 MyPic 打开”时，先直接展示传入图片，
+        // 不让首次权限申请挡在图片前面。已有相册读取权限时仍在后台刷新图库。
+        boolean handledExternalImage = handleIncomingImageIntent(getIntent());
+        if (handledExternalImage) {
+            if (hasLibraryReadPermission()) startScanning();
+        } else {
+            checkPermissionsAndScan();
+        }
     }
 
     private void initViews() {
@@ -199,6 +228,11 @@ public class MainActivity extends AppCompatActivity {
     private void setupCustomFastScroller() {
         RecyclerView.OnScrollListener scrollListener = new RecyclerView.OnScrollListener() {
             @Override
+            public void onScrollStateChanged(@NonNull RecyclerView recyclerView, int newState) {
+                galleryScrollBusy = newState != RecyclerView.SCROLL_STATE_IDLE;
+            }
+
+            @Override
             public void onScrolled(@NonNull RecyclerView rv, int dx, int dy) {
                 if (dy == 0) return;
 
@@ -230,6 +264,8 @@ public class MainActivity extends AppCompatActivity {
         globalFastScroller.setOnTouchListener(new View.OnTouchListener() {
             private float downY;
             private float downTranslationY;
+            private int lastDispatchedPosition = RecyclerView.NO_POSITION;
+            private long lastDispatchMs = 0L;
 
             @Override
             public boolean onTouch(View v, MotionEvent event) {
@@ -241,8 +277,12 @@ public class MainActivity extends AppCompatActivity {
                         v.removeCallbacks(hideScrollerRunnable);
                         // 🚨 核心：按压状态赋予内部的可见滑块，让它变蓝！
                         globalFastScrollerThumb.setPressed(true);
+                        galleryScrollBusy = true;
+                        setFastScrollThumbnailMode(currentFastScrollTarget, true);
                         downY = event.getRawY();
                         downTranslationY = v.getTranslationY();
+                        lastDispatchedPosition = RecyclerView.NO_POSITION;
+                        lastDispatchMs = 0L;
                         return true;
 
                     case MotionEvent.ACTION_MOVE:
@@ -255,19 +295,46 @@ public class MainActivity extends AppCompatActivity {
                         newY = Math.max(minY, Math.min(newY, maxY));
                         v.setTranslationY(newY);
 
-                        float progress = (newY - minY) / maxThumbY;
-                        int totalItems = currentFastScrollTarget.getAdapter().getItemCount();
-                        int targetPos = (int) (progress * (totalItems - 1));
+                        if (maxThumbY > 0 && currentFastScrollTarget.getAdapter() != null) {
+                            float progress = (newY - minY) / maxThumbY;
+                            int totalItems = currentFastScrollTarget.getAdapter().getItemCount();
+                            if (totalItems > 0) {
+                                int targetPos = Math.max(0, Math.min(totalItems - 1, (int) (progress * (totalItems - 1))));
+                                long now = android.os.SystemClock.uptimeMillis();
 
-                        RecyclerView.LayoutManager layoutManager = currentFastScrollTarget.getLayoutManager();
-                        if (layoutManager instanceof GridLayoutManager) {
-                            ((GridLayoutManager) layoutManager).scrollToPositionWithOffset(targetPos, 0);
+                                // 手指 MOVE 事件可能达到 100+ 次/秒。限制列表真正跳转到约 20fps，
+                                // 避免每经过几十张就创建一批马上被取消的 Glide 解码任务。
+                                if (targetPos != lastDispatchedPosition && now - lastDispatchMs >= 50L) {
+                                    RecyclerView.LayoutManager layoutManager = currentFastScrollTarget.getLayoutManager();
+                                    if (layoutManager instanceof GridLayoutManager) {
+                                        ((GridLayoutManager) layoutManager).scrollToPositionWithOffset(targetPos, 0);
+                                        lastDispatchedPosition = targetPos;
+                                        lastDispatchMs = now;
+                                    }
+                                }
+                            }
                         }
                         return true;
 
                     case MotionEvent.ACTION_UP:
                     case MotionEvent.ACTION_CANCEL:
-                        // 🚨 松手后恢复灰色
+                        // 松手时强制落到滑块最终位置，确保没有被 50ms 节流跳过。
+                        int finalMaxThumbY = currentFastScrollTarget.getHeight() - v.getHeight();
+                        if (finalMaxThumbY > 0 && currentFastScrollTarget.getAdapter() != null) {
+                            float finalMinY = currentFastScrollTarget.getTop();
+                            float finalProgress = (v.getTranslationY() - finalMinY) / finalMaxThumbY;
+                            finalProgress = Math.max(0f, Math.min(1f, finalProgress));
+                            int totalItems = currentFastScrollTarget.getAdapter().getItemCount();
+                            if (totalItems > 0) {
+                                int targetPos = (int) (finalProgress * (totalItems - 1));
+                                RecyclerView.LayoutManager layoutManager = currentFastScrollTarget.getLayoutManager();
+                                if (layoutManager instanceof GridLayoutManager) {
+                                    ((GridLayoutManager) layoutManager).scrollToPositionWithOffset(targetPos, 0);
+                                }
+                            }
+                        }
+                        setFastScrollThumbnailMode(currentFastScrollTarget, false);
+                        galleryScrollBusy = false;
                         globalFastScrollerThumb.setPressed(false);
                         v.postDelayed(hideScrollerRunnable, 1500);
                         return true;
@@ -278,7 +345,12 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void initRecyclerViews() {
-        recyclerView.setLayoutManager(new GridLayoutManager(this, 4));
+        GridLayoutManager mainGridLayout = new GridLayoutManager(this, 4);
+        mainGridLayout.setInitialPrefetchItemCount(16);
+        recyclerView.setLayoutManager(mainGridLayout);
+        recyclerView.setHasFixedSize(true);
+        recyclerView.setItemViewCacheSize(24);
+        recyclerView.setItemAnimator(null);
         adapter = new MediaAdapter(this, currentDisplayList, new MediaAdapter.OnMediaInteractionListener() {
             @Override public void onSingleClick(MediaItem item) { enterSingleView(item); }
             @Override public void onStartDragSelect(int pos) { isDragSelecting = true; lastSelectedPosition = pos; updateGlobalSelectionUI(); }
@@ -289,7 +361,12 @@ public class MainActivity extends AppCompatActivity {
         recyclerSimilarGroups.setLayoutManager(new GridLayoutManager(this, 1));
         groupAdapter = new SimilarGroupAdapter(); recyclerSimilarGroups.setAdapter(groupAdapter);
 
-        recyclerSearchResults.setLayoutManager(new GridLayoutManager(this, 4));
+        GridLayoutManager searchGridLayout = new GridLayoutManager(this, 4);
+        searchGridLayout.setInitialPrefetchItemCount(16);
+        recyclerSearchResults.setLayoutManager(searchGridLayout);
+        recyclerSearchResults.setHasFixedSize(true);
+        recyclerSearchResults.setItemViewCacheSize(24);
+        recyclerSearchResults.setItemAnimator(null);
         searchAdapter = new MediaAdapter(this, searchResultList, new MediaAdapter.OnMediaInteractionListener() {
             @Override public void onSingleClick(MediaItem item) { enterSingleView(item); }
             @Override public void onStartDragSelect(int pos) { isDragSelecting = true; lastSelectedPosition = pos; updateGlobalSelectionUI(); }
@@ -340,7 +417,10 @@ public class MainActivity extends AppCompatActivity {
         });
 
         btnShare.setOnClickListener(v -> shareSelectedMedia());
-        btnCopy.setOnClickListener(v -> requestBatchSafAuth(() -> showSafTransferDialog(false)));
+        btnCopy.setOnClickListener(v -> {
+            if (isViewingSingle) copyCurrentImageText();
+            else requestBatchSafAuth(() -> showSafTransferDialog(false));
+        });
         btnMove.setOnClickListener(v -> requestBatchSafAuth(() -> showSafTransferDialog(true)));
         btnDelete.setOnClickListener(v -> requestBatchSafAuth(this::performSafTrashTask));
         btnMenuSimilar.setOnClickListener(v -> { if (drawerLayout != null) drawerLayout.closeDrawer(GravityCompat.START); requestBatchSafAuth(this::startSimilarScanTask); });
@@ -552,10 +632,19 @@ public class MainActivity extends AppCompatActivity {
      * 🚨 混合双通道读取：先用 File API 极速读取，被拒后再用 ContentResolver 兜底
      */
     private boolean isActualGif(MediaItem item) {
-        if (item.path == null) return false;
+        // 外部 ACTION_VIEW 传入的 Uri 可能没有真实 path，但 MIME 仍然可靠。
+        if ("image/gif".equalsIgnoreCase(item.mimeType)) return true;
 
-        // 1. 毫秒级放行：如果扩展名或系统 MIME 已经明确是 GIF，直接秒过，不耗费任何 IO
-        if (item.path.toLowerCase().endsWith(".gif") || "image/gif".equalsIgnoreCase(item.mimeType)) {
+        if (item.path == null) {
+            try (java.io.InputStream is = getContentResolver().openInputStream(item.uri)) {
+                return is != null && checkMagicBytes(is);
+            } catch (Exception ignored) {
+                return false;
+            }
+        }
+
+        // 1. 毫秒级放行：如果扩展名已经明确是 GIF，直接秒过，不耗费任何 IO
+        if (item.path.toLowerCase().endsWith(".gif")) {
             return true;
         }
 
@@ -724,51 +813,77 @@ public class MainActivity extends AppCompatActivity {
 
     // ================= 🚨 重构 1：全局极速后台扫描引擎 =================
     private void startBackgroundOcrIndexing() {
-        // 只有第一次打开 App 时才显示提示
+        // 同一时刻只允许一条全局 OCR 索引任务，避免多次 onResume 把 7000 张任务重复排队。
+        if (!ocrIndexingRunning.compareAndSet(false, true)) return;
+
         if (isFirstLaunch) {
             Toast.makeText(this, "系统正在后台构建全局极速索引 (动图 & OCR)...", Toast.LENGTH_SHORT).show();
-            isFirstLaunch = false; // 播完立刻设为 false，以后的调用全变静默
+            isFirstLaunch = false;
         }
         final java.util.List<MediaItem> snapshotList = new java.util.ArrayList<>(allMediaList);
 
         executorService.execute(() -> {
-            OcrDao dao = AppDatabase.getInstance(this).ocrDao();
-            int newIndexedCount = 0;
+            android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_BACKGROUND);
+            try {
+                OcrDao dao = AppDatabase.getInstance(this).ocrDao();
+                int newIndexedCount = 0;
 
-            for (MediaItem item : snapshotList) {
-                if (item.type != MediaItem.MediaType.IMAGE) continue;
+                for (MediaItem item : snapshotList) {
+                    if (item.type != MediaItem.MediaType.IMAGE) continue;
+                    if (isUriInDeleteGracePeriod(item.uri)) continue;
 
-                Long savedDate = dao.getModifiedDate(item.uri.toString());
-                boolean needScan = (savedDate == null || Math.abs(savedDate - item.dateModified) > 5);
+                    // 用户在查看页主动点“复制文字”时，让交互 OCR 优先于后台建库。
+                    while (userOcrInProgress || galleryScrollBusy) {
+                        try { Thread.sleep(60); } catch (InterruptedException e) {
+                            Thread.currentThread().interrupt();
+                            return;
+                        }
+                    }
 
-                if (needScan) {
-                    // 1. 穿透沙盒，嗅探底层魔数是否为动图
-                    boolean isGif = isActualGif(item);
+                    Long savedDate = dao.getModifiedDate(item.uri.toString());
+                    boolean needScan = (savedDate == null || Math.abs(savedDate - item.dateModified) > 5);
 
-                    // 2. 嗅探是否包含文字
-                    String extractedText = OcrEngine.getInstance().extractTextFromImage(this, item.uri);
-                    boolean hasText = extractedText != null && !extractedText.trim().isEmpty();
+                    if (needScan) {
+                        boolean isGif = isActualGif(item);
+                        String extractedText = OcrEngine.getInstance().extractTextFromImage(this, item.uri);
+                        boolean hasText = extractedText != null && !extractedText.trim().isEmpty();
 
-                    // 3. 将所有状态一并写入数据库！
-                    dao.insertOcrData(new ImageOcrData(
-                            item.uri.toString(),
-                            item.dateModified,
-                            extractedText == null ? "" : extractedText,
-                            isGif,     // 存入是否为动图
-                            !hasText   // 存入是否为无字图
-                    ));
-                    newIndexedCount++;
+                        // OCR 过程中如果用户把图片删了，不允许旧任务把数据库记录重新写回来。
+                        if (!isUriInDeleteGracePeriod(item.uri)) {
+                            dao.insertOcrData(new ImageOcrData(
+                                    item.uri.toString(),
+                                    item.dateModified,
+                                    extractedText == null ? "" : extractedText,
+                                    isGif,
+                                    !hasText
+                            ));
+                            newIndexedCount++;
+                        }
+                    }
                 }
+                if (newIndexedCount > 0) {
+                    android.util.Log.i("MyPic", "✅ 全局索引构建完成，本次新增: " + newIndexedCount + " 张照片。");
+                }
+            } finally {
+                ocrIndexingRunning.set(false);
             }
-            if (newIndexedCount > 0) android.util.Log.i("MyPic", "✅ 全局索引构建完成，本次新增: " + newIndexedCount + " 张照片。");
         });
     }
 
     private void startScanning() {
+        final int scanGeneration = mediaScanGeneration.incrementAndGet();
         executorService.execute(() -> {
-            List<MediaItem> s = MediaScanner.scanAllMedia(this);
+            List<MediaItem> scanned = MediaScanner.scanAllMedia(this);
+
+            // MediaStore 删除落盘可能比系统确认页返回慢几百毫秒。短时间内把刚删除的 Uri 当作 tombstone。
+            scanned.removeIf(item -> isUriInDeleteGracePeriod(item.uri));
+
             runOnUiThread(() -> {
-                allMediaList.clear(); allMediaList.addAll(s);
+                // 有更新的扫描/删除动作发生时，旧扫描结果直接作废，不能覆盖当前列表。
+                if (scanGeneration != mediaScanGeneration.get()) return;
+
+                allMediaList.clear();
+                allMediaList.addAll(scanned);
 
                 categorizeMedia();
                 refreshHomeCategoriesUI();
@@ -783,21 +898,43 @@ public class MainActivity extends AppCompatActivity {
                 }
 
                 adapter.notifyDataSetChanged();
-                if(viewerAdapter != null) viewerAdapter.notifyDataSetChanged();
+                if (viewerAdapter != null) viewerAdapter.notifyDataSetChanged();
                 updateGlobalSelectionUI();
                 startBackgroundOcrIndexing();
             });
         });
     }
 
+    private boolean isUriInDeleteGracePeriod(Uri uri) {
+        if (uri == null) return false;
+        String key = uri.toString();
+        Long removedAt = recentlyRemovedUris.get(key);
+        if (removedAt == null) return false;
+        if (System.currentTimeMillis() - removedAt <= MEDIASTORE_DELETE_GRACE_MS) return true;
+        recentlyRemovedUris.remove(key, removedAt);
+        return false;
+    }
+
     private void updateGlobalSelectionUI() {
         int count = adapter.selectedItems.size();
+        if (!isViewingSingle) {
+            btnCopy.setText("复制");
+            btnCopy.setEnabled(true);
+        }
         if (count > 0 || isViewingSingle || isViewingSimilar) {
             if (!isImmersiveMode) layoutBottomBar.setVisibility(View.VISIBLE);
 
             if (isViewingSingle) {
-                tvTitle.setText(""); btnCopy.setVisibility(View.GONE); btnMove.setVisibility(View.GONE); btnShare.setVisibility(View.VISIBLE);
-                btnDelete.setVisibility(View.VISIBLE); btnDelete.setText("删除"); btnDelete.setTextColor(Color.parseColor("#FF0000")); btnDelete.setEnabled(true);
+                MediaItem viewerItem = getCurrentViewerItem();
+                boolean canCopyText = viewerItem != null && viewerItem.type == MediaItem.MediaType.IMAGE;
+                tvTitle.setText("");
+                btnCopy.setVisibility(canCopyText ? View.VISIBLE : View.GONE);
+                btnCopy.setText("复制文字");
+                btnCopy.setEnabled(canCopyText && !userOcrInProgress);
+                btnMove.setVisibility(View.GONE);
+                btnShare.setVisibility(View.VISIBLE);
+                btnDelete.setVisibility(isViewingExternalImage ? View.GONE : View.VISIBLE);
+                btnDelete.setText("删除"); btnDelete.setTextColor(Color.parseColor("#FF0000")); btnDelete.setEnabled(!isViewingExternalImage);
             } else if (isViewingSimilar) {
                 btnCopy.setVisibility(View.GONE); btnMove.setVisibility(View.GONE); btnShare.setVisibility(View.GONE); btnDelete.setVisibility(View.VISIBLE);
                 if (count > 0) { tvTitle.setText("已选 " + count + " 项冗余图"); btnDelete.setText("一键清理 (" + count + ")"); btnDelete.setTextColor(Color.parseColor("#FF0000")); btnDelete.setEnabled(true); } else { tvTitle.setText("清理相似照片"); btnDelete.setText("请勾选待删图"); btnDelete.setTextColor(Color.parseColor("#999999")); btnDelete.setEnabled(false); }
@@ -874,15 +1011,25 @@ public class MainActivity extends AppCompatActivity {
         TextView tvProgress = new TextView(this); tvProgress.setTextSize(16); tvProgress.setTextColor(Color.BLACK); tvProgress.setPadding(0, 0, 0, 30);
         ProgressBar progressBar = new ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal); progressBar.setMax(imageItems.size());
         layout.addView(tvProgress); layout.addView(progressBar);
-        AlertDialog dialog = new AlertDialog.Builder(this).setTitle("AI 深度聚类中").setView(layout).setCancelable(false).show();
+        AlertDialog dialog = new AlertDialog.Builder(this).setTitle("扫描相似冗余图片").setView(layout).setCancelable(false).show();
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
 
         SimilarityEngine.startScan(this, imageItems, executorService, new SimilarityEngine.ScanCallback() {
-            @Override public void onProgress(int current, int total) { runOnUiThread(() -> { if (dialog.isShowing()) { progressBar.setProgress(current); tvProgress.setText("提取指纹: " + (int)(((float)current/total)*100) + "% (" + current + "/" + total + ")"); } }); }
+            @Override public void onProgress(String stage, int current, int total) {
+                runOnUiThread(() -> {
+                    if (dialog.isShowing()) {
+                        int safeTotal = Math.max(1, total);
+                        progressBar.setMax(safeTotal);
+                        progressBar.setProgress(Math.max(0, Math.min(current, safeTotal)));
+                        int percent = Math.max(0, Math.min(100, Math.round(current * 100f / safeTotal)));
+                        tvProgress.setText(stage + ": " + percent + "% (" + current + "/" + total + ")");
+                    }
+                });
+            }
             @Override public void onComplete(List<SimilarGroup> result, long timeTakenMs) {
                 runOnUiThread(() -> {
                     getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON); dialog.dismiss();
-                    if (result.isEmpty()) Toast.makeText(MainActivity.this, "未发现 90% 以上重复图", Toast.LENGTH_LONG).show();
+                    if (result.isEmpty()) Toast.makeText(MainActivity.this, "未发现高相似冗余图片", Toast.LENGTH_LONG).show();
                     else { similarGroupsResult.clear(); similarGroupsResult.addAll(result); isViewingSimilar = true; isViewingSearch = false; layoutHomeCategories.setVisibility(View.GONE); recyclerView.setVisibility(View.GONE); layoutSearchContainer.setVisibility(View.GONE); layoutSimilarContainer.setVisibility(View.VISIBLE); tvLeftAction.setText("返回"); tvLeftAction.setVisibility(View.VISIBLE); updateGlobalSelectionUI(); groupAdapter.notifyDataSetChanged(); }
                 });
             }
@@ -971,9 +1118,25 @@ public class MainActivity extends AppCompatActivity {
         new AlertDialog.Builder(this).setTitle("安全清理").setMessage("确定删除这 " + totalItems + " 项照片吗？")
                 .setPositiveButton("删除", (dialog, which) -> {
                     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                        // 必须在跳到系统删除确认页之前保存稳定快照。确认页返回时，onResume 可能已经触发过扫描，
+                        // adapter.selectedItems 里的对象不能再作为“本次真正删除了谁”的唯一依据。
+                        pendingSystemDeleteItems.clear();
+                        pendingSystemDeleteItems.addAll(new ArrayList<>(adapter.selectedItems));
+
                         List<Uri> urisToDelete = new ArrayList<>();
-                        for (MediaItem item : adapter.selectedItems) urisToDelete.add(item.uri);
-                        try { android.app.PendingIntent pi = MediaStore.createDeleteRequest(getContentResolver(), urisToDelete); startIntentSenderForResult(pi.getIntentSender(), 3000, null, 0, 0, 0, null); } catch (Exception e) { Log.e("Delete", "请求批量删除失败", e); } return;
+                        for (MediaItem item : pendingSystemDeleteItems) urisToDelete.add(item.uri);
+
+                        lastLocalActionTime = System.currentTimeMillis();
+                        mediaScanGeneration.incrementAndGet(); // 让尚未返回的旧 MediaStore 扫描结果立即失效
+                        try {
+                            android.app.PendingIntent pi = MediaStore.createDeleteRequest(getContentResolver(), urisToDelete);
+                            startIntentSenderForResult(pi.getIntentSender(), 3000, null, 0, 0, 0, null);
+                        } catch (Exception e) {
+                            pendingSystemDeleteItems.clear();
+                            Log.e("Delete", "请求批量删除失败", e);
+                            Toast.makeText(this, "无法发起系统删除请求", Toast.LENGTH_SHORT).show();
+                        }
+                        return;
                     }
                     LinearLayout layout = new LinearLayout(this); layout.setOrientation(LinearLayout.VERTICAL); layout.setPadding(60, 60, 60, 60);
                     TextView tvProgress = new TextView(this); tvProgress.setTextColor(Color.BLACK); tvProgress.setPadding(0, 0, 0, 30);
@@ -1002,11 +1165,15 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void removePendingItemsFromUI() {
+        if (pendingRemoveItems.isEmpty()) return;
 
-        // =========================================================
-        // 🚨 核心添加：只要执行了界面移除，说明刚刚发生了真实删除/移动，立刻重置冷却时间！
-        MainActivity.lastLocalActionTime = System.currentTimeMillis();
-        // =========================================================
+        // 真实删除/移动完成：失效所有旧扫描，并给 MediaStore 一个短暂同步窗口。
+        long now = System.currentTimeMillis();
+        MainActivity.lastLocalActionTime = now;
+        mediaScanGeneration.incrementAndGet();
+        for (MediaItem item : pendingRemoveItems) {
+            if (item.uri != null) recentlyRemovedUris.put(item.uri.toString(), now);
+        }
 
         allMediaList.removeAll(pendingRemoveItems);
         cameraList.removeAll(pendingRemoveItems);
@@ -1019,7 +1186,11 @@ public class MainActivity extends AppCompatActivity {
         List<MediaItem> itemsToDelete = new ArrayList<>(pendingRemoveItems);
         executorService.execute(() -> {
             for(MediaItem item : itemsToDelete) {
-                try { AppDatabase.getInstance(this).ocrDao().deleteByUri(item.uri.toString()); } catch (Exception e) { Log.e("Database", "删除数据库记录失败", e); }
+                try {
+                    OcrDao dao = AppDatabase.getInstance(this).ocrDao();
+                    dao.deleteByUri(item.uri.toString());
+                    dao.deleteSimilarityFingerprintByUri(item.uri.toString());
+                } catch (Exception e) { Log.e("Database", "删除数据库记录失败", e); }
             }
         });
 
@@ -1054,12 +1225,16 @@ public class MainActivity extends AppCompatActivity {
     private void refreshAfterAction() { exitMultiSelectMode(); if (isViewingSingle) closeViewer(); startScanning(); }
 
     private void enterSingleView(MediaItem item) {
+        isViewingExternalImage = false;
+        openedFromExternalIntent = false;
+        openViewer(item, isViewingSearch ? searchResultList : currentDisplayList);
+    }
+
+    private void openViewer(MediaItem item, List<MediaItem> targetList) {
         isViewingSingle = true;
         adapter.selectedItems.clear(); adapter.selectedItems.add(item);
         recyclerView.setVisibility(View.INVISIBLE); layoutHomeCategories.setVisibility(View.GONE); layoutViewer.setVisibility(View.VISIBLE);
         tvLeftAction.setText("返回"); tvLeftAction.setVisibility(View.VISIBLE);
-
-        List<MediaItem> targetList = isViewingSearch ? searchResultList : currentDisplayList;
 
         viewerAdapter = new ViewerAdapter(this, targetList, new ViewerAdapter.OnViewerItemClickListener() {
             @Override public void onImageClick() { toggleImmersiveMode(); }
@@ -1081,7 +1256,7 @@ public class MainActivity extends AppCompatActivity {
         viewPager.registerOnPageChangeCallback(new ViewPager2.OnPageChangeCallback() {
             @Override public void onPageSelected(int position) {
                 if (isViewingSingle) {
-                    List<MediaItem> targetList = isViewingSearch ? searchResultList : currentDisplayList;
+                    List<MediaItem> targetList = getViewerTargetList();
                     if (position < targetList.size()) {
                         MediaItem item = targetList.get(position);
                         adapter.selectedItems.clear(); adapter.selectedItems.add(item);
@@ -1098,12 +1273,119 @@ public class MainActivity extends AppCompatActivity {
         tvRightAction.setVisibility(View.VISIBLE);
     }
 
+    private List<MediaItem> getViewerTargetList() {
+        if (isViewingExternalImage) return externalViewerList;
+        return isViewingSearch ? searchResultList : currentDisplayList;
+    }
+
+    private MediaItem getCurrentViewerItem() {
+        if (!isViewingSingle) return null;
+        List<MediaItem> targetList = getViewerTargetList();
+        if (targetList == null || targetList.isEmpty()) return null;
+        int position = viewPager.getCurrentItem();
+        if (position < 0 || position >= targetList.size()) return null;
+        return targetList.get(position);
+    }
+
+    /**
+     * 查看页一键复制图片文字：优先复用后台 OCR 数据库；图片新增/修改时才现场识别。
+     */
+    private void copyCurrentImageText() {
+        MediaItem item = getCurrentViewerItem();
+        if (item == null || item.type != MediaItem.MediaType.IMAGE) {
+            Toast.makeText(this, "当前项目不是可识别图片", Toast.LENGTH_SHORT).show();
+            return;
+        }
+
+        LinearLayout progressLayout = new LinearLayout(this);
+        progressLayout.setOrientation(LinearLayout.HORIZONTAL);
+        progressLayout.setPadding(48, 36, 48, 36);
+        progressLayout.setGravity(android.view.Gravity.CENTER_VERTICAL);
+        ProgressBar progress = new ProgressBar(this);
+        TextView message = new TextView(this);
+        message.setText("  正在识别并复制图片文字…");
+        message.setTextSize(16);
+        message.setTextColor(Color.BLACK);
+        progressLayout.addView(progress);
+        progressLayout.addView(message);
+
+        AlertDialog dialog = new AlertDialog.Builder(this)
+                .setTitle("复制图片文字")
+                .setView(progressLayout)
+                .setCancelable(false)
+                .show();
+
+        btnCopy.setEnabled(false);
+        userOcrInProgress = true;
+
+        executorService.execute(() -> {
+            String resultText = null;
+            boolean failed = false;
+            try {
+                OcrDao dao = AppDatabase.getInstance(this).ocrDao();
+                Long savedDate = dao.getModifiedDate(item.uri.toString());
+                String orderedCacheKey = "ordered_ocr_v3:" + item.uri;
+                boolean orderedCacheReady = prefs.getBoolean(orderedCacheKey, false);
+
+                // v3 同时升级长图区域解码、切片去重和阅读顺序。旧缓存无法判断是否由旧长图算法生成，
+                // 因此某张图片升级后第一次点“复制文字”时仅重识别这一张并覆盖缓存；以后仍是毫秒级读取。
+                if (orderedCacheReady && savedDate != null && Math.abs(savedDate - item.dateModified) <= 5) {
+                    resultText = dao.getExtractedText(item.uri.toString());
+                } else {
+                    resultText = OcrEngine.getInstance().extractTextFromImage(this, item.uri);
+                    if (resultText != null && !isUriInDeleteGracePeriod(item.uri)) {
+                        boolean isGif = isActualGif(item);
+                        boolean hasText = !resultText.trim().isEmpty();
+                        dao.insertOcrData(new ImageOcrData(
+                                item.uri.toString(), item.dateModified, resultText, isGif, !hasText));
+                        prefs.edit().putBoolean(orderedCacheKey, true).apply();
+                    }
+                }
+            } catch (Exception e) {
+                failed = true;
+                Log.e("CopyImageText", "图片文字识别失败", e);
+            }
+
+            String finalText = resultText == null ? "" : resultText.trim();
+            boolean finalFailed = failed;
+            runOnUiThread(() -> {
+                userOcrInProgress = false;
+                if (dialog.isShowing()) dialog.dismiss();
+                if (isViewingSingle) btnCopy.setEnabled(true);
+
+                if (finalFailed) {
+                    Toast.makeText(this, "文字识别失败，请重试", Toast.LENGTH_SHORT).show();
+                } else if (finalText.isEmpty()) {
+                    Toast.makeText(this, "未识别到可复制文字", Toast.LENGTH_SHORT).show();
+                } else {
+                    ClipboardManager clipboard = (ClipboardManager) getSystemService(CLIPBOARD_SERVICE);
+                    clipboard.setPrimaryClip(ClipData.newPlainText("图片文字", finalText));
+                    Toast.makeText(this, "已复制识别文字（" + finalText.length() + " 字符）", Toast.LENGTH_SHORT).show();
+                }
+            });
+        });
+    }
+
     private void enterMultiSelectUI() { tvLeftAction.setText("取消"); tvLeftAction.setVisibility(View.VISIBLE); updateGlobalSelectionUI(); }
     private void handleDragSelect(RecyclerView rv, MotionEvent e, List<MediaItem> targetList) { View child = rv.findChildViewUnder(e.getX(), e.getY()); if (child != null) { int pos = rv.getChildAdapterPosition(child); if (pos != RecyclerView.NO_POSITION && pos != lastSelectedPosition) { MediaItem item = targetList.get(pos); if (!adapter.selectedItems.contains(item)) adapter.selectedItems.add(item); else adapter.selectedItems.remove(item); if (rv.getAdapter() != null) rv.getAdapter().notifyItemChanged(pos); lastSelectedPosition = pos; updateGlobalSelectionUI(); } } }
 
     private void closeViewer() {
         if (isImmersiveMode) toggleImmersiveMode();
-        isViewingSingle = false; adapter.selectedItems.clear(); layoutViewer.setVisibility(View.GONE);
+
+        // 作为系统图片查看器被唤起时，“返回”应直接回到原文件管理器。
+        if (openedFromExternalIntent) {
+            openedFromExternalIntent = false;
+            isViewingExternalImage = false;
+            externalViewerList.clear();
+            finish();
+            return;
+        }
+
+        isViewingSingle = false;
+        isViewingExternalImage = false;
+        externalViewerList.clear();
+        adapter.selectedItems.clear();
+        layoutViewer.setVisibility(View.GONE);
         if (isViewingCategoryGrid) recyclerView.setVisibility(View.VISIBLE);
         else layoutHomeCategories.setVisibility(View.VISIBLE);
 
@@ -1149,6 +1431,76 @@ public class MainActivity extends AppCompatActivity {
         startActivity(Intent.createChooser(intent, "分享"));
     }
 
+    /**
+     * 快速滚动期间只移动列表，不加载沿途缩略图；松手后仅重新绑定最终屏幕。
+     * 这能避免 7000 张规模下拖动一次右侧滑块产生数百个已过期解码任务。
+     */
+    private void setFastScrollThumbnailMode(RecyclerView rv, boolean active) {
+        if (rv == null || !(rv.getAdapter() instanceof MediaAdapter)) return;
+        MediaAdapter mediaAdapter = (MediaAdapter) rv.getAdapter();
+        mediaAdapter.setFastScrollActive(active);
+
+        RecyclerView.LayoutManager layoutManager = rv.getLayoutManager();
+        if (layoutManager instanceof GridLayoutManager) {
+            GridLayoutManager grid = (GridLayoutManager) layoutManager;
+            int first = grid.findFirstVisibleItemPosition();
+            int last = grid.findLastVisibleItemPosition();
+            if (first != RecyclerView.NO_POSITION && last >= first) {
+                mediaAdapter.notifyItemRangeChanged(first, last - first + 1);
+            }
+        }
+    }
+
+    private boolean hasLibraryReadPermission() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            return ContextCompat.checkSelfPermission(this, Manifest.permission.READ_MEDIA_IMAGES) == PackageManager.PERMISSION_GRANTED
+                    && ContextCompat.checkSelfPermission(this, Manifest.permission.READ_MEDIA_VIDEO) == PackageManager.PERMISSION_GRANTED;
+        }
+        return ContextCompat.checkSelfPermission(this, Manifest.permission.READ_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED;
+    }
+
+    private boolean handleIncomingImageIntent(Intent intent) {
+        if (intent == null || !Intent.ACTION_VIEW.equals(intent.getAction())) return false;
+        Uri uri = intent.getData();
+        if (uri == null) return false;
+
+        String mimeType = intent.getType();
+        if (mimeType == null || mimeType.isEmpty()) {
+            mimeType = getContentResolver().getType(uri);
+        }
+        if (mimeType == null || !mimeType.startsWith("image/")) return false;
+
+        try {
+            // 对 ACTION_VIEW 来说通常是临时 grant；能持久化时顺手保留，不能持久化也不影响当前查看。
+            int takeFlags = intent.getFlags() & (Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
+            if ("content".equals(uri.getScheme()) && takeFlags != 0) {
+                try { getContentResolver().takePersistableUriPermission(uri, takeFlags); } catch (Exception ignored) {}
+            }
+
+            long nowSeconds = System.currentTimeMillis() / 1000L;
+            MediaItem externalItem = new MediaItem(uri, null, nowSeconds, 0L, mimeType, MediaItem.MediaType.IMAGE);
+            externalViewerList.clear();
+            externalViewerList.add(externalItem);
+            layoutSearchContainer.setVisibility(View.GONE);
+            layoutSimilarContainer.setVisibility(View.GONE);
+            isViewingExternalImage = true;
+            openedFromExternalIntent = true;
+            openViewer(externalItem, externalViewerList);
+            return true;
+        } catch (Exception e) {
+            Log.e("ExternalImage", "无法打开外部图片", e);
+            Toast.makeText(this, "无法打开该图片", Toast.LENGTH_SHORT).show();
+            return false;
+        }
+    }
+
+    @Override
+    protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+        setIntent(intent);
+        handleIncomingImageIntent(intent);
+    }
+
     // ================= 🚨 终极适配：全机型权限动态申请 =================
     private void checkPermissionsAndScan() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
@@ -1182,6 +1534,9 @@ public class MainActivity extends AppCompatActivity {
     protected void onResume() {
         super.onResume();
         if (!isFirstLaunch) {
+            // 外部 ACTION_VIEW 只依赖对方临时授予的 Uri 读取权限；没有图库权限时不要突然弹全库权限。
+            if (openedFromExternalIntent && !hasLibraryReadPermission()) return;
+
             // 核心修复：如果距离上一次 App 内的删除等操作不到 2 秒，直接跳过本次系统刷新！
             // 给安卓底层的 MediaStore 留出同步删除记录的时间，彻底掐死幽灵数据
             if (System.currentTimeMillis() - lastLocalActionTime > 2000) {
@@ -1218,9 +1573,16 @@ public class MainActivity extends AppCompatActivity {
 //        if (requestCode == 2000) checkPermissionsAndScan();
         if (requestCode == 3000) {
             if (resultCode == Activity.RESULT_OK) {
-                pendingRemoveItems.clear(); pendingRemoveItems.addAll(adapter.selectedItems); removePendingItemsFromUI();
-                Toast.makeText(this, "✅ 成功删除 " + pendingRemoveItems.size() + " 张图片", Toast.LENGTH_SHORT).show();
-            } else Toast.makeText(this, "❌ 您取消了删除", Toast.LENGTH_SHORT).show();
+                pendingRemoveItems.clear();
+                pendingRemoveItems.addAll(pendingSystemDeleteItems);
+                int deletedCount = pendingRemoveItems.size();
+                removePendingItemsFromUI();
+                pendingSystemDeleteItems.clear();
+                Toast.makeText(this, "✅ 成功删除 " + deletedCount + " 项", Toast.LENGTH_SHORT).show();
+            } else {
+                pendingSystemDeleteItems.clear();
+                Toast.makeText(this, "❌ 您取消了删除", Toast.LENGTH_SHORT).show();
+            }
         }
     }
 }

@@ -25,7 +25,10 @@ public class MediaScanner {
                 MediaStore.Files.FileColumns.DATE_ADDED,
                 MediaStore.Files.FileColumns.DATE_MODIFIED, // 🚨 新增查询修改时间
                 MediaStore.Files.FileColumns.MIME_TYPE,
-                MediaStore.Files.FileColumns.MEDIA_TYPE
+                MediaStore.Files.FileColumns.MEDIA_TYPE,
+                MediaStore.MediaColumns.WIDTH,
+                MediaStore.MediaColumns.HEIGHT,
+                MediaStore.MediaColumns.SIZE
         };
 
         // 过滤条件：只查图片和视频
@@ -43,6 +46,9 @@ public class MediaScanner {
                 int dateModifiedCol = cursor.getColumnIndexOrThrow(MediaStore.Files.FileColumns.DATE_MODIFIED); // 🚨 获取列索引
                 int mimeTypeCol = cursor.getColumnIndexOrThrow(MediaStore.Files.FileColumns.MIME_TYPE);
                 int mediaTypeCol = cursor.getColumnIndexOrThrow(MediaStore.Files.FileColumns.MEDIA_TYPE);
+                int widthCol = cursor.getColumnIndexOrThrow(MediaStore.MediaColumns.WIDTH);
+                int heightCol = cursor.getColumnIndexOrThrow(MediaStore.MediaColumns.HEIGHT);
+                int sizeCol = cursor.getColumnIndexOrThrow(MediaStore.MediaColumns.SIZE);
 
                 while (cursor.moveToNext()) {
                     long id = cursor.getLong(idCol);
@@ -51,6 +57,9 @@ public class MediaScanner {
                     long dateModified = cursor.getLong(dateModifiedCol); // 🚨 读取游标里的真实修改时间
                     String mimeType = cursor.getString(mimeTypeCol);
                     int mediaType = cursor.getInt(mediaTypeCol);
+                    int width = cursor.isNull(widthCol) ? 0 : cursor.getInt(widthCol);
+                    int height = cursor.isNull(heightCol) ? 0 : cursor.getInt(heightCol);
+                    long fileSize = cursor.isNull(sizeCol) ? 0L : cursor.getLong(sizeCol);
 
                     // 组装真实的 Uri
                     Uri contentUri = ContentUris.withAppendedId(
@@ -62,7 +71,8 @@ public class MediaScanner {
                             MediaItem.MediaType.IMAGE : MediaItem.MediaType.VIDEO;
 
                     // 🚨 传入 dateModified
-                    mediaList.add(new MediaItem(contentUri, path, dateAdded, dateModified, mimeType, type));
+                    mediaList.add(new MediaItem(contentUri, path, dateAdded, dateModified, mimeType, type,
+                            width, height, fileSize));
                 }
             }
         } catch (Exception e) {

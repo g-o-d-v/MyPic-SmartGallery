@@ -1,67 +1,199 @@
-# MyPic - 纯本地智能相册引擎 (Smart Local Gallery)
+# MyPic
 
-![Android](https://badgen.net/badge/Platform/Android/green)
-![Java](https://badgen.net/badge/Language/Java/blue)
-![PaddleOCR](https://badgen.net/badge/AI/PaddleOCR_v4/orange)
-![License](https://badgen.net/badge/License/MIT/brightgreen)
+> 纯本地、重隐私的 Android 智能图片管理工具
 
-MyPic 是一款主打**隐私安全**与**极速检索**的 Android 本地智能相册应用。基于设备端原生算力，在无需任何网络连接的情况下，实现毫秒级的图片 OCR 全文检索、精准相似图清理、以及深度文件过滤。
+MyPic 是一款面向本地图库管理的 Android 应用，重点解决**大量图片浏览、OCR 文字检索与复制、相似冗余图片清理、动图/无字图片筛选**等实际问题。
 
-## 📸 应用截图
+图片分析、OCR 与相似度计算均在设备本地完成，无需将图片上传到在线服务器。
 
+## 应用截图
 
 <div align="center">
-  <img src="screenshots/home.png" width="80%" />
+  <img src="screenshots/home.png" width="80%" alt="MyPic 首页" />
 </div>
 
 <br>
 
 <div align="center">
-  <table align="center" width="100%">
+  <table width="100%">
     <tr>
-      <th align="center">百宝箱工具页</th>
-      <th align="center">智能 OCR 搜索结果</th>
+      <th align="center">百宝箱</th>
+      <th align="center">OCR 智能搜图</th>
     </tr>
     <tr>
       <td align="center" width="50%">
-        <img src="screenshots/tools.jpg" width="100%" />
+        <img src="screenshots/tools.jpg" width="100%" alt="MyPic 百宝箱" />
       </td>
       <td align="center" width="50%">
-        <img src="screenshots/search.jpg" width="100%" />
+        <img src="screenshots/search.jpg" width="100%" alt="MyPic OCR 搜索" />
       </td>
     </tr>
   </table>
 </div>
 
-## ✨ 核心特性与工程亮点 (Features & Engineering Highlights)
+## 主要功能
 
-### 1. 🔍 离线 OCR 极速全文搜索
-* **引擎底层：** 深度集成 **Baidu PaddleOCR v4** 轻量级端侧模型。
-* **长图切片算法 (Sliding Window)：** 针对长截屏导致 OCR 降采样糊图的问题，在 Java 层自研“带重叠区动态切片”策略，突破长图识别瓶颈。
-* **抗混叠插值强化：** 针对加粗文字/小字粘连问题，在送入模型前实施基于 `Matrix` 的双线性平滑插值放大 (1.5x)，大幅提升极限场景识别率。
-* **闪电建库：** 结合 Room 数据库进行增量扫描与后台静默建库，实现万张图片毫秒级文字检索。
+### 图片与视频浏览
 
-### 2. 🧹 高精度相似/冗余图清理
-* **感知哈希 (pHash) + 汉明距离：** 提取图片 256 位结构指纹，容忍社交软件的轻微变色压缩。
-* **长宽比物理防火墙：** 针对高频图（漫画、文字梗图）压缩导致的哈希位翻转问题，引入 `AspectRatio` 绝对防火墙，并在极低耗时下实现了 90% 阈值的精准相似度聚类。
+- 浏览设备中的所有照片、相机图片、截图与视频。
+- 面向大图库优化缩略图加载与快速滚动体验。
+- Android 10 及以上优先使用系统 MediaStore 缩略图能力。
+- 图片查看页支持缩放、分享等常用操作。
+- 可注册为系统图片查看器，从文件管理器或其他应用中直接“用 MyPic 打开”图片。
 
-### 3. 🛡️ 降维打击的文件过滤器
-* **无字纯图提取：** 结合底层数据库 Set 求差集与物理路径黑名单（穿透社交软件分身图），极速精准过滤表情包与风景照。
-* **真伪动图嗅探：** 不依赖文件后缀，直接通过魔数与 `mimeType` 穿透沙盒，精准揪出被篡改后缀的 WebP 伪装动图。
+### 本地 OCR 智能搜图
 
-## 🛠️ 技术栈 (Tech Stack)
-* **语言：** Java
-* **AI 视觉引擎：** Paddle Lite, PaddleOCR v4, OpenCV
-* **本地存储：** Android Room (SQLite)
-* **图片加载：** Glide
-* **异步调度：** 线程池 (ExecutorService)
+MyPic 集成 Paddle Lite / PaddleOCR，在设备本地建立图片文字索引。
 
-## 🚀 快速体验 (Download & Install)
-你可以直接在 [Releases 页面](https://github.com/你的用户名/项目名/releases) 下载最新版的 APK 文件进行安装体验。
-*(注意：首次冷启动会在后台建立 OCR 与动图索引，图片较多时请耐心等待几分钟，后续均为毫秒级静默刷新。)*
+- 输入关键词即可检索图片中的文字。
+- OCR 数据存储在本地 Room 数据库中。
+- 已完成索引的图片无需重复识别。
+- 支持增量更新，新图片或发生修改的图片才需要重新处理。
+- OCR 识别过程无需在线服务。
 
-## 💻 编译运行指南 (Build Setup)
-1. 确保你的 Android Studio 版本为 Arctic Fox 或更高。
-2. 克隆本仓库：
-   ```bash
-   git clone https://github.com/g-o-d-v/MyPic-SmartGallery.git
+### 一键复制图片文字
+
+在图片查看页点击 **“复制文字”**，即可将图片中的文字复制到系统剪贴板。
+
+- 优先读取已经建立的 OCR 缓存。
+- 未建立缓存时自动执行本地识别。
+- 文字按照图片中的视觉阅读顺序整理：从上到下、同一行从左到右。
+- 针对长截图采用原图分块识别，避免将整张长图过度缩小后导致小字模糊。
+- 长图切片结果会映射回全局坐标并去除重叠区域产生的重复文本。
+
+### 高精度相似 / 冗余图片扫描
+
+MyPic 不仅使用单一图片哈希，而是通过多阶段算法减少误判并提高大图库扫描速度。
+
+候选召回包含：
+
+- dHash
+- pHash
+- Edge Hash
+- LSH 候选索引
+
+进入精判后进一步结合：
+
+- 灰度结构相关性
+- 边缘结构相似度
+- 亮度修正后的像素差异
+- RGB 颜色直方图
+- 轻微裁剪 / 位移容错
+
+对于高度相似图片，会以较高质量图片作为组内锚点，每张候选都需要直接与锚点达到相似度要求，减少链式聚类造成的误合并。
+
+### 相似图片指纹缓存
+
+相似图片扫描生成的特征会缓存在本地数据库中。
+
+只要图片的 URI、修改时间、文件大小和尺寸没有变化，后续扫描即可直接复用指纹，不必重新解码整张图片。
+
+针对数千张级图库还进行了以下优化：
+
+- 分页读取数据库指纹，避免 Android CursorWindow 容量问题。
+- LSH 先筛候选，再执行高成本精判。
+- 数学上界提前淘汰不可能达到阈值的候选。
+- 仅对真正位于阈值附近的候选执行位移配准。
+- 候选较多时使用受控多线程精判。
+
+### 动图识别
+
+可快速筛选图库中的 GIF / 动图内容。
+
+除扩展名外，还会结合 MIME 类型和文件特征进行判断，可识别部分扩展名与真实格式不一致的动图文件。
+
+### 无文字图片筛选
+
+利用本地 OCR 索引筛选没有检测到文字的静态图片，并结合相机照片、动图等条件进一步过滤结果。
+
+### 文件操作
+
+支持常用本地图片管理操作：
+
+- 多选
+- 分享
+- 复制
+- 移动
+- 删除
+
+删除流程针对 Android MediaStore 的异步更新进行了处理，降低“文件已经删除但界面仍残留旧项目”的概率。
+
+## v1.0.1 重点改进
+
+相比初始版本，v1.0.1 重点改善了大图库使用体验与本地智能分析能力：
+
+- 大幅提升数千张图库快速跳转后的缩略图加载速度。
+- 修复部分场景下删除图片后界面仍残留旧条目的问题。
+- 新增图片查看页“一键复制文字”。
+- 修复 OCR 文本顺序错误与长截图识别质量问题。
+- 支持从系统文件管理器直接使用 MyPic 打开图片。
+- 重构相似 / 冗余图片算法，引入多特征精判、持久化指纹缓存与 LSH 候选筛选。
+- 优化数千张图片场景下相似图扫描的候选筛选与精确分组速度。
+- 相似图扫描增加明确的分阶段进度显示。
+
+## 隐私
+
+MyPic 的核心图片分析功能在本地完成：
+
+- OCR 本地执行
+- 相似图片计算本地执行
+- OCR 索引存储在本地数据库
+- 相似图片指纹存储在本地数据库
+
+应用无需为了 OCR 或相似图片分析上传用户图片。
+
+## 技术栈
+
+- **平台：** Android
+- **语言：** Java
+- **OCR / AI：** Paddle Lite、PaddleOCR
+- **图像处理：** OpenCV
+- **数据库：** Android Room / SQLite
+- **图片加载：** Glide + MediaStore Thumbnail
+- **图片查看：** PhotoView
+- **异步任务：** ExecutorService
+- **存储访问：** MediaStore、SAF
+
+## 系统要求
+
+- Android 7.0（API 24）及以上
+- 当前构建目标：Android 14（API 34）
+- 当前 APK 构建配置：`arm64-v8a`
+
+> 因当前版本仅打包 `arm64-v8a`，32 位 ARM 设备无法安装此 APK。
+
+## 构建
+
+推荐使用较新的 Android Studio，并准备：
+
+- JDK 17
+- Android SDK 34
+- NDK `21.4.7075529`
+- CMake `3.22.1`
+
+克隆项目：
+
+```bash
+git clone https://github.com/g-o-d-v/MyPic-SmartGallery.git
+```
+
+然后使用 Android Studio 打开项目并完成 Gradle Sync。
+
+## 下载
+
+预编译 APK 请前往 GitHub **Releases** 页面下载。
+
+首次安装后，OCR 等需要建立本地索引的功能可能需要一定时间完成初始处理；后续会复用已有数据库和图片指纹，只处理新增或发生变化的内容。
+
+## 关于数据升级
+
+v1.0.1 的本地数据库增加了相似图片指纹缓存表。
+
+- **新安装用户：** Room 会直接创建当前版本数据库，无需执行旧版本迁移。
+- **从旧版本升级：** 应用通过数据库 Migration 保留原有 OCR 数据，并新增相似图片缓存表。
+
+数据库内容仅作为本地索引与缓存使用，删除应用后会随应用数据一起移除。
+
+## 项目说明
+
+MyPic 仍在持续迭代。不同 Android 厂商对 MediaStore、文件权限和图片解码的实现可能存在差异，如遇到兼容性问题，建议在反馈时附带 Android 版本、设备型号和相关日志。
