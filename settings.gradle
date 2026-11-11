@@ -23,7 +23,18 @@ dependencyResolutionManagement {
         // 官方备用源
         google()
         mavenCentral()
-        maven { url 'https://jitpack.io' } // 很多开源库需要的 JitPack 仓库
+        maven {
+            url 'https://jitpack.io' // 很多开源库需要的 JitPack 仓库
+            // 仅将 JitPack 限定用于 GitHub 坐标，避免非 JitPack 依赖缺失 javadoc/sources 时回退请求 jitpack.io 导致 Sync 卡顿
+            content {
+                includeGroupByRegex 'com\\.github\\..*'
+            }
+            // jitpack 上部分库发布的 .module 将 sources/javadoc 指向同名 .jar（实际为 -sources.jar / -javadoc.jar），会导致 IDE Sync 卡死或 404
+            metadataSources {
+                mavenPom()
+                artifact()
+            }
+        }
     }
 }
 

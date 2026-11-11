@@ -829,11 +829,13 @@ public class MainActivity extends AppCompatActivity {
                 int newIndexedCount = 0;
 
                 for (MediaItem item : snapshotList) {
+                    if (isFinishing() || isDestroyed()) break;
                     if (item.type != MediaItem.MediaType.IMAGE) continue;
                     if (isUriInDeleteGracePeriod(item.uri)) continue;
 
                     // 用户在查看页主动点“复制文字”时，让交互 OCR 优先于后台建库。
                     while (userOcrInProgress || galleryScrollBusy) {
+                        if (isFinishing() || isDestroyed()) return;
                         try { Thread.sleep(60); } catch (InterruptedException e) {
                             Thread.currentThread().interrupt();
                             return;
@@ -845,7 +847,7 @@ public class MainActivity extends AppCompatActivity {
 
                     if (needScan) {
                         boolean isGif = isActualGif(item);
-                        String extractedText = OcrEngine.getInstance().extractTextFromImage(this, item.uri);
+                        String extractedText = ImageOcrHelper.extractText(this, item.uri);
                         boolean hasText = extractedText != null && !extractedText.trim().isEmpty();
 
                         // OCR 过程中如果用户把图片删了，不允许旧任务把数据库记录重新写回来。
@@ -857,6 +859,9 @@ public class MainActivity extends AppCompatActivity {
                                     isGif,
                                     !hasText
                             ));
+                            if (extractedText != null) {
+                                prefs.edit().putBoolean(ocrCacheFlagKey(item.uri), true).apply();
+                            }
                             newIndexedCount++;
                         }
                     }
@@ -1324,15 +1329,15 @@ public class MainActivity extends AppCompatActivity {
             try {
                 OcrDao dao = AppDatabase.getInstance(this).ocrDao();
                 Long savedDate = dao.getModifiedDate(item.uri.toString());
-                String orderedCacheKey = "ordered_ocr_v3:" + item.uri;
+                String orderedCacheKey = ocrCacheFlagKey(item.uri);
                 boolean orderedCacheReady = prefs.getBoolean(orderedCacheKey, false);
 
-                // v3 同时升级长图区域解码、切片去重和阅读顺序。旧缓存无法判断是否由旧长图算法生成，
-                // 因此某张图片升级后第一次点“复制文字”时仅重识别这一张并覆盖缓存；以后仍是毫秒级读取。
+                // 切换为带段落检测的新版 OCR 提取格式；若尚未写入当前版本缓存标记，
+                // 首次点“复制文字”时重识别并覆盖缓存，后续直接从本地数据库毫秒级读取。
                 if (orderedCacheReady && savedDate != null && Math.abs(savedDate - item.dateModified) <= 5) {
                     resultText = dao.getExtractedText(item.uri.toString());
                 } else {
-                    resultText = OcrEngine.getInstance().extractTextFromImage(this, item.uri);
+                    resultText = ImageOcrHelper.extractText(this, item.uri);
                     if (resultText != null && !isUriInDeleteGracePeriod(item.uri)) {
                         boolean isGif = isActualGif(item);
                         boolean hasText = !resultText.trim().isEmpty();
@@ -1472,9 +1477,21 @@ public class MainActivity extends AppCompatActivity {
 
         try {
             // 对 ACTION_VIEW 来说通常是临时 grant；能持久化时顺手保留，不能持久化也不影响当前查看。
-            int takeFlags = intent.getFlags() & (Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
-            if ("content".equals(uri.getScheme()) && takeFlags != 0) {
-                try { getContentResolver().takePersistableUriPermission(uri, takeFlags); } catch (Exception ignored) {}
+            if ("content".equals(uri.getScheme())) {
+                int rawFlags = intent.getFlags();
+                boolean canRead = (rawFlags & Intent.FLAG_GRANT_READ_URI_PERMISSION) != 0;
+                boolean canWrite = (rawFlags & Intent.FLAG_GRANT_WRITE_URI_PERMISSION) != 0;
+                if (canRead || canWrite) {
+                    try {
+                        // 直接传入常量组合，满足 Android Lint / IDE 对 @IntDef 的静态检查
+                        getContentResolver().takePersistableUriPermission(
+                                uri,
+                                canRead && canWrite
+                                        ? (Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
+                                        : (canRead ? Intent.FLAG_GRANT_READ_URI_PERMISSION : Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
+                        );
+                    } catch (Exception ignored) {}
+                }
             }
 
             long nowSeconds = System.currentTimeMillis() / 1000L;
@@ -1499,6 +1516,10 @@ public class MainActivity extends AppCompatActivity {
         super.onNewIntent(intent);
         setIntent(intent);
         handleIncomingImageIntent(intent);
+    }
+
+    private static String ocrCacheFlagKey(Uri uri) {
+        return "pdf_search_ocr_v2:" + uri;
     }
 
     // ================= 🚨 终极适配：全机型权限动态申请 =================
@@ -1527,6 +1548,20 @@ public class MainActivity extends AppCompatActivity {
                 startScanning();
             }
         }
+    }
+
+    @Override
+    public void onTrimMemory(int level) {
+        super.onTrimMemory(level);
+        if (level >= TRIM_MEMORY_BACKGROUND) {
+            ImageOcrHelper.releaseIfIdle();
+        }
+    }
+
+    @Override
+    protected void onDestroy() {
+        super.onDestroy();
+        ImageOcrHelper.releaseIfIdle();
     }
 
     // ================= 🚨 修复版：带冷却防抖的静默刷新 =================
