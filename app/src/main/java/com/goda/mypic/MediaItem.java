@@ -7,8 +7,12 @@ import java.util.Objects;
 public class MediaItem {
     public Uri uri;
     public String path;
+    // 优先 EXIF/拍摄时间 (DATE_TAKEN)，若无则降级为修改时间 (DATE_MODIFIED)，单位：毫秒
+    public long dateTaken;
+    // 兼容保留字段 (单位：秒，即 dateTaken / 1000L)
     public long dateAdded;
-    public long dateModified; // 记录文件的最后修改时间戳
+    // 记录文件的真实最后修改时间戳 (单位：秒，用于 Room / 缩略图缓存校验)
+    public long dateModified;
     public String mimeType;
     public MediaType type;
     // MediaStore 元数据：相似图扫描可直接使用，避免每次为尺寸/大小额外打开文件。
@@ -16,20 +20,26 @@ public class MediaItem {
     public int height;
     public long fileSize;
 
-    // 🚨 恢复了你原本的 GIF 类型，修复编译报错
     public enum MediaType {
         IMAGE, VIDEO, GIF
     }
 
-    public MediaItem(Uri uri, String path, long dateAdded, long dateModified, String mimeType, MediaType type) {
-        this(uri, path, dateAdded, dateModified, mimeType, type, 0, 0, 0L);
+    public MediaItem(Uri uri, String path, long dateTaken, long dateModified, String mimeType, MediaType type) {
+        this(uri, path, dateTaken, dateModified, mimeType, type, 0, 0, 0L);
     }
 
-    public MediaItem(Uri uri, String path, long dateAdded, long dateModified, String mimeType, MediaType type,
+    public MediaItem(Uri uri, String path, long dateTaken, long dateModified, String mimeType, MediaType type,
                      int width, int height, long fileSize) {
         this.uri = uri;
         this.path = path;
-        this.dateAdded = dateAdded;
+        // 智能兼容毫秒或秒：若大于等于 100_000_000_000L (11位，代表毫秒)，直接赋值；若小于则视为秒并转为毫秒
+        if (dateTaken >= 100_000_000_000L) {
+            this.dateTaken = dateTaken;
+            this.dateAdded = dateTaken / 1000L;
+        } else {
+            this.dateTaken = dateTaken * 1000L;
+            this.dateAdded = dateTaken;
+        }
         this.dateModified = dateModified;
         this.mimeType = mimeType;
         this.type = type;

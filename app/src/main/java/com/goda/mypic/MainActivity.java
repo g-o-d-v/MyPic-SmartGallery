@@ -49,6 +49,9 @@ import androidx.recyclerview.widget.RecyclerView;
 import androidx.viewpager2.widget.ViewPager2;
 
 import com.bumptech.glide.Glide;
+import android.database.Cursor;
+import android.media.ExifInterface;
+import java.io.InputStream;
 
 import java.io.File;
 import java.text.SimpleDateFormat;
@@ -566,6 +569,7 @@ public class MainActivity extends AppCompatActivity {
                     }
                 }
             }
+            searchResultList.sort((a, b) -> Long.compare(b.dateTaken, a.dateTaken));
 
             runOnUiThread(() -> {
                 dialog.dismiss();
@@ -609,7 +613,7 @@ public class MainActivity extends AppCompatActivity {
                 }
             }
 
-            searchResultList.sort((a, b) -> Long.compare(b.dateAdded, a.dateAdded));
+            searchResultList.sort((a, b) -> Long.compare(b.dateTaken, a.dateTaken));
 
             runOnUiThread(() -> {
                 dialog.dismiss();
@@ -702,20 +706,23 @@ public class MainActivity extends AppCompatActivity {
         executorService.execute(() -> {
             Calendar startCal = Calendar.getInstance();
             startCal.set(year, month, day, 0, 0, 0);
-            long startTime = startCal.getTimeInMillis() / 1000;
+            startCal.set(Calendar.MILLISECOND, 0);
+            long startTimeMs = startCal.getTimeInMillis();
 
             Calendar endCal = Calendar.getInstance();
             endCal.set(year, month, day, 23, 59, 59);
-            long endTime = endCal.getTimeInMillis() / 1000;
+            endCal.set(Calendar.MILLISECOND, 999);
+            long endTimeMs = endCal.getTimeInMillis();
 
             String dateStr = String.format(Locale.getDefault(), "%04d-%02d-%02d", year, month + 1, day);
 
             searchResultList.clear();
             for (MediaItem item : allMediaList) {
-                if (item.dateAdded >= startTime && item.dateAdded <= endTime) {
+                if (item.dateTaken >= startTimeMs && item.dateTaken <= endTimeMs) {
                     searchResultList.add(item);
                 }
             }
+            searchResultList.sort((a, b) -> Long.compare(b.dateTaken, a.dateTaken));
 
             runOnUiThread(() -> {
                 if (searchResultList.isEmpty()) {
@@ -792,7 +799,7 @@ public class MainActivity extends AppCompatActivity {
             }
 
             // 按时间倒序排列 (最新的在最前面)
-            searchResultList.sort((a, b) -> Long.compare(b.dateAdded, a.dateAdded));
+            searchResultList.sort((a, b) -> Long.compare(b.dateTaken, a.dateTaken));
 
             runOnUiThread(() -> {
                 dialog.dismiss();
@@ -1221,7 +1228,7 @@ public class MainActivity extends AppCompatActivity {
                 if (currentPos >= targetList.size()) currentPos = targetList.size() - 1;
                 MediaItem currentNewItem = targetList.get(currentPos);
                 adapter.selectedItems.add(currentNewItem);
-                tvRightAction.setText(new SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.getDefault()).format(new Date(currentNewItem.dateAdded * 1000)));
+                tvRightAction.setText(new SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.getDefault()).format(new Date(currentNewItem.dateTaken)));
             }
         }
         updateGlobalSelectionUI();
@@ -1266,7 +1273,7 @@ public class MainActivity extends AppCompatActivity {
                         MediaItem item = targetList.get(position);
                         adapter.selectedItems.clear(); adapter.selectedItems.add(item);
                         updateGlobalSelectionUI();
-                        tvRightAction.setText(new SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.getDefault()).format(new Date(item.dateAdded * 1000)));
+                        tvRightAction.setText(new SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.getDefault()).format(new Date(item.dateTaken)));
                         tvRightAction.setVisibility(View.VISIBLE);
                     }
                 }
@@ -1274,7 +1281,7 @@ public class MainActivity extends AppCompatActivity {
         });
 
         updateGlobalSelectionUI();
-        tvRightAction.setText(new SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.getDefault()).format(new Date(item.dateAdded * 1000)));
+        tvRightAction.setText(new SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.getDefault()).format(new Date(item.dateTaken)));
         tvRightAction.setVisibility(View.VISIBLE);
     }
 
@@ -1464,6 +1471,44 @@ public class MainActivity extends AppCompatActivity {
         return ContextCompat.checkSelfPermission(this, Manifest.permission.READ_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED;
     }
 
+    private long resolveExifOrModifiedDate(Uri uri) {
+        if (uri == null) return System.currentTimeMillis();
+        // 1. 优先尝试从 ExifInterface 读取拍摄时间 (毫秒)
+        try (InputStream is = getContentResolver().openInputStream(uri)) {
+            if (is != null) {
+                ExifInterface exif = new ExifInterface(is);
+                String dateTime = exif.getAttribute(ExifInterface.TAG_DATETIME_ORIGINAL);
+                if (dateTime == null) {
+                    dateTime = exif.getAttribute(ExifInterface.TAG_DATETIME);
+                }
+                if (dateTime == null) {
+                    dateTime = exif.getAttribute(ExifInterface.TAG_DATETIME_DIGITIZED);
+                }
+                if (dateTime != null) {
+                    SimpleDateFormat sdf = new SimpleDateFormat("yyyy:MM:dd HH:mm:ss", Locale.US);
+                    Date parsed = sdf.parse(dateTime);
+                    if (parsed != null && parsed.getTime() > 0) {
+                        return parsed.getTime();
+                    }
+                }
+            }
+        } catch (Exception ignored) {}
+
+        // 2. 降级尝试从 ContentResolver 查询最后修改时间 (DATE_MODIFIED)
+        try (Cursor c = getContentResolver().query(uri, new String[]{MediaStore.MediaColumns.DATE_MODIFIED}, null, null, null)) {
+            if (c != null && c.moveToFirst()) {
+                int modCol = c.getColumnIndex(MediaStore.MediaColumns.DATE_MODIFIED);
+                if (modCol >= 0 && !c.isNull(modCol)) {
+                    long sec = c.getLong(modCol);
+                    if (sec > 0) return sec * 1000L;
+                }
+            }
+        } catch (Exception ignored) {}
+
+        // 3. 兜底使用当前系统时间
+        return System.currentTimeMillis();
+    }
+
     private boolean handleIncomingImageIntent(Intent intent) {
         if (intent == null || !Intent.ACTION_VIEW.equals(intent.getAction())) return false;
         Uri uri = intent.getData();
@@ -1494,8 +1539,8 @@ public class MainActivity extends AppCompatActivity {
                 }
             }
 
-            long nowSeconds = System.currentTimeMillis() / 1000L;
-            MediaItem externalItem = new MediaItem(uri, null, nowSeconds, 0L, mimeType, MediaItem.MediaType.IMAGE);
+            long takenMs = resolveExifOrModifiedDate(uri);
+            MediaItem externalItem = new MediaItem(uri, null, takenMs, takenMs / 1000L, mimeType, MediaItem.MediaType.IMAGE);
             externalViewerList.clear();
             externalViewerList.add(externalItem);
             layoutSearchContainer.setVisibility(View.GONE);

@@ -256,7 +256,7 @@ public class SimilarityEngine {
                 if (cmp != 0) return cmp;
                 cmp = Long.compare(b.fileSize, a.fileSize);
                 if (cmp != 0) return cmp;
-                return Long.compare(b.item.dateAdded, a.item.dateAdded);
+                return Long.compare(b.item.dateTaken, a.item.dateTaken);
             });
 
             Fingerprint[] arr = fingerprints.toArray(new Fingerprint[0]);
